@@ -1,0 +1,118 @@
+name: Deploy to AWS (Carbon-Aware)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      urgency:
+        description: "Bypass carbon check (hotfix/rollback)"
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write   # OIDC for AWS auth
+  contents: read
+
+jobs:
+  # ──────────────────────────────────────────────
+  # 1. Build & test (always runs immediately)
+  # ──────────────────────────────────────────────
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install & test
+        run: |
+          pip install -r requirements.txt
+          pytest tests/ -v
+
+      - name: Build Docker image
+        run: docker build -t myapp:${{ github.sha }} .
+
+      - name: Push to ECR
+        run: |
+          aws ecr get-login-password | docker login --username AWS \
+            --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+          docker tag myapp:${{ github.sha }} \
+            ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/myapp:${{ github.sha }}
+          docker push \
+            ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/myapp:${{ github.sha }}
+
+  # ──────────────────────────────────────────────
+  # 2. Carbon gate — may hold this job
+  # ──────────────────────────────────────────────
+  carbon-gate:
+    runs-on: ubuntu-latest
+    needs: build
+    outputs:
+      decision: ${{ steps.gate.outputs.decision }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Carbon gate check
+        id: gate
+        uses: ./.github/actions/carbon-gate
+        with:
+          aws_region: us-east-1
+          carbon_threshold: 250
+          urgency: ${{ inputs.urgency || 'false' }}
+          electricity_maps_token: ${{ secrets.ELECTRICITY_MAPS_TOKEN }}
+          job_type: deploy
+          sqs_queue_url: ${{ secrets.SQS_QUEUE_URL }}
+          s3_carbon_bucket: ${{ secrets.S3_CARBON_BUCKET }}
+
+  # ──────────────────────────────────────────────
+  # 3. Deploy — only runs if gate says go
+  # ──────────────────────────────────────────────
+  deploy:
+    runs-on: ubuntu-latest
+    needs: carbon-gate
+    if: |
+      needs.carbon-gate.outputs.decision == 'DEPLOY_NOW' ||
+      needs.carbon-gate.outputs.decision == 'OVERRIDE'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Deploy to ECS
+        run: |
+          aws ecs update-service \
+            --cluster production \
+            --service myapp \
+            --force-new-deployment \
+            --region us-east-1
+
+      - name: Wait for deployment
+        run: |
+          aws ecs wait services-stable \
+            --cluster production \
+            --services myapp \
+            --region us-east-1
+
+      - name: Notify Slack
+        if: always()
+        run: |
+          curl -X POST ${{ secrets.SLACK_WEBHOOK }} \
+            -H 'Content-type: application/json' \
+            --data '{
+              "text": "Deployment complete for `${{ github.repository }}` @ `${{ github.sha }}` (carbon: ${{ needs.carbon-gate.outputs.carbon_intensity }} gCO₂/kWh)"
+            }'

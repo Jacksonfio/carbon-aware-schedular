@@ -1,0 +1,164 @@
+name: "Carbon-Aware Deployment Gate"
+description: >
+  Checks real-time grid carbon intensity for the target AWS region.
+  Deploys immediately if the grid is green, or queues the job for a
+  greener window.
+
+branding:
+  icon: "cloud"
+  color: "green"
+
+inputs:
+  aws_region:
+    description: "Target AWS region for the deployment"
+    required: true
+    default: "us-east-1"
+
+  carbon_threshold:
+    description: "gCO₂/kWh above which deployments are held (default: 250)"
+    required: false
+    default: "250"
+
+  urgency:
+    description: "Set to 'true' to bypass the carbon check (e.g. hotfix)"
+    required: false
+    default: "false"
+
+  electricity_maps_token:
+    description: "API token for Electricity Maps (electricitymaps.com)"
+    required: true
+
+  job_type:
+    description: "Type of job: deploy | release | rollback | smoke-test"
+    required: false
+    default: "deploy"
+
+  sqs_queue_url:
+    description: "AWS SQS queue URL for held jobs (required if not urgency)"
+    required: false
+    default: ""
+
+  s3_carbon_bucket:
+    description: "S3 bucket name for carbon log records"
+    required: false
+    default: ""
+
+outputs:
+  decision:
+    description: "Scheduler decision: DEPLOY_NOW | HOLD | OVERRIDE"
+    value: ${{ steps.carbon-gate.outputs.decision }}
+
+  carbon_intensity:
+    description: "Observed carbon intensity in gCO₂/kWh"
+    value: ${{ steps.carbon-gate.outputs.carbon_intensity }}
+
+  estimated_co2_kg:
+    description: "Estimated CO₂ for this deployment in kg"
+    value: ${{ steps.carbon-gate.outputs.estimated_co2_kg }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install dependencies
+      shell: bash
+      run: pip install requests boto3 --quiet
+
+    - name: Run carbon gate
+      id: carbon-gate
+      shell: bash
+      env:
+        ELECTRICITY_MAPS_TOKEN: ${{ inputs.electricity_maps_token }}
+        AWS_REGION: ${{ inputs.aws_region }}
+        CARBON_THRESHOLD: ${{ inputs.carbon_threshold }}
+        URGENCY_OVERRIDE: ${{ inputs.urgency }}
+        JOB_TYPE: ${{ inputs.job_type }}
+        SQS_QUEUE_URL: ${{ inputs.sqs_queue_url }}
+        S3_CARBON_BUCKET: ${{ inputs.s3_carbon_bucket }}
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        cd ${{ github.action_path }}/../../..
+        export PYTHONPATH=src
+        python -m scheduler.scheduler > /tmp/carbon_decision.json
+        cat /tmp/carbon_decision.json
+
+        DECISION=$(python -c "import json; d=json.load(open('/tmp/carbon_decision.json')); print(d['decision'])")
+        INTENSITY=$(python -c "import json; d=json.load(open('/tmp/carbon_decision.json')); print(d['carbon_intensity'])")
+        CO2_KG=$(python -c "import json; d=json.load(open('/tmp/carbon_decision.json')); print(d['estimated_co2_kg'])")
+        REASON=$(python -c "import json; d=json.load(open('/tmp/carbon_decision.json')); print(d['reason'])")
+
+        echo "decision=$DECISION" >> $GITHUB_OUTPUT
+        echo "carbon_intensity=$INTENSITY" >> $GITHUB_OUTPUT
+        echo "estimated_co2_kg=$CO2_KG" >> $GITHUB_OUTPUT
+
+        # Write to GitHub Actions job summary
+        python -c "
+        import json
+        d = json.load(open('/tmp/carbon_decision.json'))
+        icons = {'DEPLOY_NOW': '✅', 'HOLD': '⏳', 'OVERRIDE': '🚨'}
+        icon = icons.get(d['decision'], '❓')
+        print(f'## {icon} Carbon Gate — {d[\"decision\"]}')
+        print()
+        print('| Metric | Value |')
+        print('|--------|-------|')
+        print(f'| Carbon intensity | **{d[\"carbon_intensity\"]:.0f} gCO₂/kWh** |')
+        print(f'| Threshold | {d[\"threshold\"]:.0f} gCO₂/kWh |')
+        print(f'| Renewables | {d[\"renewable_percentage\"]:.1f}% |')
+        print(f'| Grid zone | {d[\"zone\"]} |')
+        print(f'| Est. CO₂ | {d[\"estimated_co2_kg\"]:.4f} kg |')
+        print()
+        print(f'**Reason:** {d[\"reason\"]}')
+        " >> $GITHUB_STEP_SUMMARY
+
+    - name: Enqueue held job
+      if: steps.carbon-gate.outputs.decision == 'HOLD'
+      shell: bash
+      env:
+        SQS_QUEUE_URL: ${{ inputs.sqs_queue_url }}
+        S3_CARBON_BUCKET: ${{ inputs.s3_carbon_bucket }}
+        AWS_REGION: ${{ inputs.aws_region }}
+      run: |
+        cd ${{ github.action_path }}/../../..
+        export PYTHONPATH=src
+        python -c "
+        import json, os, sys
+        sys.path.insert(0, 'src')
+        from deploy_queue.queue_manager import QueueManager
+        qm = QueueManager()
+        with open('/tmp/carbon_decision.json') as f:
+            d = json.load(f)
+        msg_id = qm.enqueue_held_job(d, d.get('context', {}))
+        print(f'Held job enqueued: {msg_id}')
+        qm.log_carbon_record(d, held_minutes=0)
+        "
+        echo "::notice title=Deployment Held::Carbon intensity too high. Job queued and will auto-deploy when the grid is greener."
+
+    - name: Log carbon record (deploy / override)
+      if: steps.carbon-gate.outputs.decision != 'HOLD'
+      shell: bash
+      env:
+        S3_CARBON_BUCKET: ${{ inputs.s3_carbon_bucket }}
+        AWS_REGION: ${{ inputs.aws_region }}
+      run: |
+        cd ${{ github.action_path }}/../../..
+        export PYTHONPATH=src
+        python -c "
+        import json, sys
+        sys.path.insert(0, 'src')
+        from deploy_queue.queue_manager import QueueManager
+        qm = QueueManager()
+        with open('/tmp/carbon_decision.json') as f:
+            d = json.load(f)
+        qm.log_carbon_record(d, held_minutes=0)
+        " || true
+
+    - name: Fail job if HOLD and no queue configured
+      if: steps.carbon-gate.outputs.decision == 'HOLD' && inputs.sqs_queue_url == ''
+      shell: bash
+      run: |
+        echo "::error::Carbon intensity too high and no SQS queue is configured. Set sqs_queue_url to enable async deployment."
+        exit 1
